@@ -12,6 +12,7 @@ from email import encoders
 from typing import List, Dict, Optional
 from datetime import datetime
 import logging
+import re
 import html2text
 
 logger = logging.getLogger(__name__)
@@ -576,8 +577,9 @@ class ArubaEmailClient:
         attachments: Optional[List[str]] = None,
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
+        draft: bool = False,
     ) -> Dict:
-        """Send an email via SMTP.
+        """Send an email via SMTP, or save it as a draft when draft=True.
         
         Args:
             to: Recipient email address
@@ -654,6 +656,9 @@ class ArubaEmailClient:
             if references:
                 msg['References'] = references
 
+            if draft:
+                return self._save_draft(msg)
+
             # Connect to SMTP server
             logger.info(f"Connecting to SMTP server {self.smtp_host}:{self.smtp_port}")
             with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port) as smtp:
@@ -700,6 +705,53 @@ class ArubaEmailClient:
         except Exception as e:
             logger.error(f"Error sending email: {e}")
             raise
+
+    def _find_drafts_folder(self) -> str:
+        """Return the IMAP drafts folder (special-use \\Drafts, else common names)."""
+        self._ensure_connected()
+        typ, data = self._connection.list()
+        names = []
+        for raw in data or []:
+            line = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+            m = re.match(r'\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.+)$', line)
+            if not m:
+                continue
+            name = m.group("name").strip()
+            if name.startswith('"') and name.endswith('"'):
+                name = name[1:-1]
+            if "\\drafts" in m.group("flags").lower():
+                return name
+            names.append(name)
+        for candidate in ("INBOX.Drafts", "Drafts", "INBOX.Bozze", "Bozze", "INBOX.Draft", "Draft"):
+            for name in names:
+                if name.lower() == candidate.lower():
+                    return name
+        return "INBOX.Drafts"
+
+    def _save_draft(self, msg) -> Dict:
+        """Append a message to the drafts folder without sending it."""
+        self._ensure_connected()
+        folder = self._find_drafts_folder()
+        imap_folder = f'"{folder}"' if " " in folder else folder
+        typ, resp = self._connection.append(
+            imap_folder,
+            "\\Draft \\Seen",
+            imaplib.Time2Internaldate(email.utils.parsedate_to_datetime(msg["Date"])),
+            msg.as_bytes(),
+        )
+        if typ != "OK":
+            raise RuntimeError(f"IMAP APPEND to {folder} failed: {resp}")
+        logger.info("Draft saved to %s", folder)
+        result = {
+            "status": "draft_saved",
+            "folder": folder,
+            "to": msg["To"],
+            "subject": msg["Subject"],
+            "from": msg["From"],
+        }
+        if msg["Cc"]:
+            result["cc"] = msg["Cc"]
+        return result
 
     def check_bounced_emails(self, folder: str = "INBOX", limit: int = 50) -> List[Dict]:
         """Check for bounced/failed delivery emails.

@@ -449,6 +449,60 @@ def send_email(
         return {"error": str(e), "status": "failed"}
 
 
+def _reply(email_id: str, body: str, cc: str, folder: str, attachments: str, draft: bool) -> dict[str, Any]:
+    """Shared logic for reply_email and create_reply_draft."""
+    if _hosted() and attachments:
+        return {"error": _not_in_hosted("Attaching local files"), "status": "failed"}
+
+    try:
+        with _get_email_client() as client:
+            original = client.read_email(email_id, folder=folder)
+
+            orig_message_id = original.get("message_id", "")
+            orig_references = original.get("references", "")
+            orig_subject = original.get("subject", "")
+            orig_from = original.get("from", "")
+
+            if orig_references and orig_message_id:
+                references = f"{orig_references} {orig_message_id}"
+            elif orig_message_id:
+                references = orig_message_id
+            else:
+                references = None
+
+            if not re.match(r"(?i)^re\s*:", orig_subject):
+                subject = f"RE: {orig_subject}"
+            else:
+                subject = orig_subject
+
+            addr_match = re.search(r'<([^>]+)>', orig_from)
+            to = addr_match.group(1) if addr_match else orig_from
+
+            attachment_list = (
+                [p.strip() for p in attachments.split(",") if p.strip()]
+                if attachments
+                else None
+            )
+
+            result = client.send_email(
+                to=to,
+                subject=subject,
+                body=body,
+                cc=cc,
+                in_reply_to=orig_message_id or None,
+                references=references,
+                attachments=attachment_list,
+                use_signature=not _hosted(),
+                draft=draft,
+            )
+            action = "Saved reply draft for" if draft else "Replied to"
+            logger.info(f"{action} email {email_id} -> {to}: {subject}")
+            return result
+    except Exception as e:
+        logger.error(f"Error replying to email {email_id}: {e}")
+        return {"error": str(e), "status": "failed"}
+
+
 @mcp.tool()
 def reply_email(
     email_id: str,
@@ -481,58 +535,75 @@ def reply_email(
             attachments="/path/to/proposal.pdf"
         )
     """
+    return _reply(email_id, body, cc, folder, attachments, draft=False)
+
+
+@mcp.tool()
+def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = None,
+    from_name: str = "",
+    attachments: str = "",
+) -> dict[str, Any]:
+    """Save a NEW email as a draft in the Aruba Drafts folder. Nothing is sent.
+
+    The user can then review, edit and send it from webmail or their mail client.
+
+    Args:
+        to: Recipient email address
+        subject: Email subject
+        body: Email body (plain text)
+        cc: Optional CC email addresses (comma-separated)
+        from_name: Sender display name (default: "" — uses email address only)
+        attachments: Optional comma-separated file paths to attach
+
+    Returns:
+        Status with the drafts folder used
+    """
     if _hosted() and attachments:
         return {"error": _not_in_hosted("Attaching local files"), "status": "failed"}
 
     try:
+        attachment_list = [p.strip() for p in attachments.split(",") if p.strip()] if attachments else None
         with _get_email_client() as client:
-            # Fetch original email to get threading headers
-            original = client.read_email(email_id, folder=folder)
-
-            orig_message_id = original.get("message_id", "")
-            orig_references = original.get("references", "")
-            orig_subject = original.get("subject", "")
-            orig_from = original.get("from", "")
-
-            # Build References header: existing chain + parent Message-ID
-            if orig_references and orig_message_id:
-                references = f"{orig_references} {orig_message_id}"
-            elif orig_message_id:
-                references = orig_message_id
-            else:
-                references = None
-
-            # Build subject with RE: prefix if not already present
-            if not re.match(r"(?i)^re\s*:", orig_subject):
-                subject = f"RE: {orig_subject}"
-            else:
-                subject = orig_subject
-
-            # Extract plain email address from "Name <email>" format
-            addr_match = re.search(r'<([^>]+)>', orig_from)
-            to = addr_match.group(1) if addr_match else orig_from
-
-            attachment_list = (
-                [p.strip() for p in attachments.split(",") if p.strip()]
-                if attachments
-                else None
-            )
-
-            result = client.send_email(
+            return client.send_email(
                 to=to,
                 subject=subject,
                 body=body,
                 cc=cc,
-                in_reply_to=orig_message_id or None,
-                references=references,
+                from_name=from_name,
                 attachments=attachment_list,
                 use_signature=not _hosted(),
+                draft=True,
             )
-            logger.info(f"Replied to email {email_id} -> {to}: {subject}")
-            return result
     except Exception as e:
-        logger.error(f"Error replying to email {email_id}: {e}")
+        logger.error(f"Error saving draft: {e}")
         return {"error": str(e), "status": "failed"}
+
+
+@mcp.tool()
+def create_reply_draft(
+    email_id: str,
+    body: str,
+    cc: str = None,
+    folder: str = "INBOX",
+    attachments: str = "",
+) -> dict[str, Any]:
+    """Save a reply to an existing email as a draft (same thread). Nothing is sent.
+
+    Args:
+        email_id: Email ID to reply to (from list_emails)
+        body: Reply body (plain text)
+        cc: Optional CC email addresses (comma-separated)
+        folder: Mail folder where the original email lives (default: INBOX)
+        attachments: Optional comma-separated file paths to attach
+
+    Returns:
+        Status with the drafts folder used
+    """
+    return _reply(email_id, body, cc, folder, attachments, draft=True)
 
 
 @mcp.tool()
