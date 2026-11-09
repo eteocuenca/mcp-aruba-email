@@ -323,7 +323,11 @@ def save_attachment(
                 folder=folder,
             )
 
-        filename = attachment["filename"]
+        # Security: the attachment name comes from the email sender. Keep only
+        # the final name component so "../" or "..\\" cannot escape save_dir.
+        raw_name = str(attachment.get("filename") or "attachment")
+        filename = re.split(r"[\\/]", raw_name)[-1].strip().lstrip(".")
+        filename = re.sub(r'[<>:"|?*\x00-\x1f]', "_", filename) or "attachment"
         data = base64.b64decode(attachment["data_base64"])
 
         # Determine save directory
